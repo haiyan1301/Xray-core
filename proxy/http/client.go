@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -218,7 +219,11 @@ func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, u
 	}
 
 	for _, h := range header {
-		req.Header.Set(h.Key, h.Value)
+		if strings.EqualFold(h.Key, "Host") {
+			req.Host = h.Value
+		} else {
+			req.Header.Set(h.Key, h.Value)
+		}
 	}
 	utils.TryDefaultHeadersWith(req.Header, "nav")
 
