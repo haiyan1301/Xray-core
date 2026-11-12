@@ -2,14 +2,13 @@ package http
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
-	"text/template"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -22,7 +21,6 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
-	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/transport"
@@ -102,13 +100,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	buf.ReleaseMulti(mbuf)
 	defer bytespool.Free(firstPayload)
 
-	header, err := fillRequestHeader(ctx, c.header)
-	if err != nil {
-		return errors.New("failed to fill out header").Base(err)
-	}
-
 	if err := retry.ExponentialBackoff(5, 100).On(func() error {
-		netConn, err := setUpHTTPTunnel(ctx, dest, targetAddr, user, dialer, header, firstPayload)
+		netConn, err := setUpHTTPTunnel(ctx, dest, targetAddr, user, dialer, c.header, firstPayload)
 		if netConn != nil {
 			if _, ok := netConn.(*http2Conn); !ok {
 				if _, err := netConn.Write(firstPayload); err != nil {
@@ -170,50 +163,26 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	return nil
 }
 
-// fillRequestHeader will fill out the template of the headers
-func fillRequestHeader(ctx context.Context, header []*Header) ([]*Header, error) {
-	if len(header) == 0 {
-		return header, nil
-	}
-
-	inbound := session.InboundFromContext(ctx)
-	outbounds := session.OutboundsFromContext(ctx)
-	ob := outbounds[len(outbounds)-1]
-
-	var src net.Destination
-	if inbound != nil {
-		src = inbound.Source
-	} else {
-		src = net.TCPDestination(net.AnyIP, 0)
-	}
-
-	data := struct {
-		Source net.Destination
-		Target net.Destination
-	}{
-		Source: src,
-		Target: ob.Target,
-	}
-
-	filled := make([]*Header, len(header))
-	for i, h := range header {
-		tmpl, err := template.New(h.Key).Parse(h.Value)
-		if err != nil {
-			return nil, err
-		}
-		var buf bytes.Buffer
-
-		if err = tmpl.Execute(&buf, data); err != nil {
-			return nil, err
-		}
-		filled[i] = &Header{Key: h.Key, Value: buf.String()}
-	}
-
-	return filled, nil
-}
-
 // setUpHTTPTunnel will create a socket tunnel via HTTP CONNECT method
 func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, user *protocol.MemoryUser, dialer internet.Dialer, header []*Header, firstPayload []byte) (net.Conn, error) {
+	// Match Mihomo's case-sensitive merge: defaults, literal custom headers,
+	// then Basic authentication when both credentials are present.
+	headers := map[string]string{
+		"Host":             target,
+		"User-Agent":       "Go-http-client/1.1",
+		"Proxy-Connection": "Keep-Alive",
+	}
+	for _, h := range header {
+		headers[h.Key] = h.Value
+	}
+	if user != nil && user.Account != nil {
+		account := user.Account.(*Account)
+		if account.GetUsername() != "" && account.GetPassword() != "" {
+			auth := account.GetUsername() + ":" + account.GetPassword()
+			headers["Proxy-Authorization"] = "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
+		}
+	}
+
 	req := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: target},
@@ -221,21 +190,26 @@ func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, u
 		Host:   target,
 	}
 
-	if user != nil && user.Account != nil {
-		account := user.Account.(*Account)
-		auth := account.GetUsername() + ":" + account.GetPassword()
-		req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
+	for key, value := range headers {
+		// HTTP/2 CONNECT uses the target as :authority and forbids
+		// Proxy-Connection. Its transport handles field-name lowercasing.
+		if strings.EqualFold(key, "Host") || strings.EqualFold(key, "Proxy-Connection") {
+			continue
+		}
+		req.Header[key] = []string{value}
 	}
-
-	for _, h := range header {
-		req.Header.Set(h.Key, h.Value)
-	}
-	utils.TryDefaultHeadersWith(req.Header, "nav")
 
 	connectHTTP1 := func(rawConn net.Conn) (net.Conn, error) {
-		req.Header.Set("Proxy-Connection", "Keep-Alive")
+		// Write the fields directly to preserve Host overrides, spelling,
+		// whitespace, and empty values without net/http normalization.
+		var request strings.Builder
+		request.WriteString("CONNECT " + target + " HTTP/1.1\r\n")
+		for key, value := range headers {
+			request.WriteString(key + ": " + value + "\r\n")
+		}
+		request.WriteString("\r\n")
 
-		err := req.Write(rawConn)
+		_, err := io.WriteString(rawConn, request.String())
 		if err != nil {
 			rawConn.Close()
 			return nil, err
